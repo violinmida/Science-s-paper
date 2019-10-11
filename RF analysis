@@ -1,0 +1,203 @@
+## Setup 
+options(stringsAsFactors = F)
+library(Matrix)
+library(dplyr)
+library(Seurat)
+library(WGCNA)
+library(AnnotationDbi)
+library(org.Mm.eg.db)
+source("~/Scripts/R/heatmap.3.R")
+source("~/Scripts/R/gg_color_hue.R")
+
+setwd("~/project/Da_Mi/")
+load("2017-11-13_working.RData")
+
+keep <- !(GB$IFC %in% c("180","181","189","190","191","192","193","194","195", "196"))
+mito.genes <- grep(pattern = "\\bMT-", x = rownames(expr))
+RP.genes <- grep(pattern = "\\bRP", x = rownames(expr))
+
+df0 <- CreateSeuratObject(raw.data = as.vector(expr[-c(mito.genes, RP.genes),keep]), 
+                          min.cells = 5, min.genes = 1000, project = "Da_Mi")
+df0 <- NormalizeData(object = df0, normalization.method = "LogNormalize", 
+                     scale.factor = 1000000)
+df0@meta.data <- cbind(df0@meta.data, GB[df0@cell.names,])
+
+#### 1. Regress out cell cycle state ####
+cc_genes <- read.csv("cell_cycle_genes.csv", header = F, stringsAsFactors = F)
+res <- sapply(cc_genes[,1], function(xx){paste("\\b",xx,"$",sep = "")})
+res <- sapply(res, function(xx){grep(xx, rownames(df0@data), value = T)})
+cc_genes[,3] <- as.character(res)
+g1s.genes <- cc_genes[,3][cc_genes$V2 == "G1/S"]
+g2m.genes <- cc_genes[,3][cc_genes$V2 == "G2/M"]
+df0 <- CellCycleScoring(df0, s.genes = g1s.genes, g2m.genes = g2m.genes, set.ident = T)
+df0@meta.data$CC.Difference <- df0@meta.data$S.Score - df0@meta.data$G2M.Score
+df0@meta.data$cc.state <- as.character(df0@ident)
+df0@meta.data$cc.state[df0@meta.data$cc.state == "G1"] <- "postmitotic"
+df0@meta.data$cc.state[df0@meta.data$cc.state == "S"] <- "G1S"
+df0@meta.data$region <- factor(df0@meta.data$region, levels = c("dMGE", "vMGE", "CGE"))
+
+df0 <- ScaleData(df0, vars.to.regress = c("nGene", "CC.Difference"))
+
+df0 <- RunPCA(df0, pc.genes = cc_genes[,3], pcs.compute = 20, pcs.print = 1:12,
+              gene.print = 10)
+
+pdf(file = paste(Sys.Date(), "PCA_with_norm_all_cells_cc.pdf", sep = "_"), 
+    width = 11, height = 10, useDingbats = F);
+PCAPlot(df0)
+dev.off()
+
+df0 <- FindVariableGenes(object = df0, mean.function = ExpMean, 
+                         dispersion.function = LogVMR, x.low.cutoff = 1, 
+                         x.high.cutoff = Inf, y.cutoff = 0.5, y.high.cutoff = 5, 
+                         do.plot = F)
+
+df0 <- RunPCA(object = df0, pc.genes=df0@var.genes, pcs.compute = 20, pcs.print = 1:12,
+              genes.print = 10)
+
+pdf(paste(Sys.Date(), "All_cells_PCA_region.pdf", sep = "_"), 
+    width = 8, height = 8, useDingbats = F);
+p1 <- PCAPlot(df0, group.by = "region",do.return = T)
+p1 <- p1 + theme(legend.position = c(0.9, 0.9),
+                 legend.background = element_rect(size=0.5,
+                                   linetype = "solid",
+                                   color = "black"))
+p1
+dev.off()
+
+p2 <- PCAPlot(df0, group.by = "time_point", do.return = T)
+p3 <- PCAPlot(df0, group.by = "IFC",do.return = T)
+pdf(paste(Sys.Date(), "All_cells_PCA.pdf", sep = "_"), width = 26, height = 8, useDingbats = F);
+plot_grid(p1, p2, p3, ncol = 3)
+
+df0 <-JackStraw(df0, num.replicate = 100, do.print = T, num.pc = 20)
+JackStrawPlot(df0, PCs = 1:20)
+
+#### 2. Use Rubenstein's list of genes to assign neuron or progenitor identity ####
+markers <- read.csv("./Rubenstein PGs vs Neuruon markers 08-11-2017.csv", header = F, stringsAsFactors = F)
+# markers <- read.csv("./MZ vs SVZ gene list 08-11-2017.csv", header = F, stringsAsFactors = F)
+# markers[,1] <- toupper(unlist(markers[, 1 ]))
+markers[,1] <- unique(sapply(c("TOP2A", "GAD1", "GAD2", markers[,1]), 
+                             function(x){paste("\\b", x, "$", sep = "")}))
+markers[,1] <- as.character(sapply(markers[,1],function(x){grep(x, rownames(df0@data), value = T)}))
+markers <- markers[markers[,1] != "character(0)",]
+markers <- markers[markers[,2] %in% c("PROGENITOR", "Neuron"),]
+dis <- as.dist(1 - cor(df0@scale.data[markers[,1],]))
+clu <- hclust(dis, method = "average")
+cl <- cutree(clu, k=2)
+
+temp <- df0@scale.data[markers[,1],]
+
+ColSideColors <- c(gg_color_hue(3)[as.numeric(as.factor(df0@meta.data$region))],
+                   rainbow(2)[as.numeric(as.factor(df0@meta.data$time_point))],
+                   brewer.pal(3, name = "Paired")[cl])#,
+ColSideColors <- matrix(ColSideColors, nrow = ncol(temp))
+
+col <- colorRampPalette(colors = c("#1b75bb", "black","#faaf40"))(1000)
+
+pairs.breaks <- seq(-1.5, 1.5, length.out=1001);
+
+pdf(file = paste(Sys.Date(), "all_cells_neuron_progenitor_heatmap.pdf", sep = "_"),
+    width = 10, height = 14, useDingbats = F);
+heatmap.3(temp,
+          breaks = pairs.breaks,
+          #symbreaks = T,
+          keysize = 0.8,
+          key = F,
+          main=NA,
+          col = col,
+          symkey = F,
+          cexRow=0.5, 
+          cexCol = 0.6, 
+          Rowv = T, 
+          Colv = as.dendrogram(clu), 
+          ColSideColors = ColSideColors,
+          ColSideColorsSize = 0.5,
+          dendrogram = "both",
+          #scale = "row",
+          #colsep = colsep,
+          sepcolor = "black",
+          labRow = substr(rownames(temp), 20, 100),
+          labCol = "",
+          na.rm = F);
+dev.off(dev.cur());
+
+#### 3. Use random forest to reassign identity ####
+library(randomForest)
+cate_bf_fs <- as.factor(cl)
+feature_bf_fs <- as.matrix(t(df0@scale.data[df0@var.genes,]))
+
+rf_bf_fs <- randomForest(feature_bf_fs, cate_bf_fs, importance = TRUE, proximity = TRUE)
+imp_bf_fs <- importance(rf_bf_fs, type = 1)
+
+fs <- rfcv(feature_bf_fs, cate_bf_fs, cv.fold = 10, scale = "log", step = 0.9, recursive = F)
+len <- length(fs$n.var[fs$error.cv == min(fs$error.cv)])
+min_fs <- fs$n.var[fs$error.cv == min(fs$error.cv)][len] #get least features
+ind <- order(-imp_bf_fs)[1: min_fs]
+feature_fs <- feature_bf_fs[ , ind]
+cate_fs <- cate_bf_fs
+
+rf_fs <- randomForest(feature_fs, as.factor(cate_fs), importance=TRUE, proximity=TRUE)
+fea1_fs <- data.frame()
+fea1_fs <- feature_fs[(rf_fs$predicted == '1') & (rf_fs$votes[ , 1] > 0.6), , drop = FALSE]
+cat1_fs <- rf_fs$predicted[(rf_fs$predicted =='1') & (rf_fs$votes[ , 1] > 0.6)]
+fea2_fs <- data.frame()
+fea2_fs <- feature_fs[(rf_fs$predicted == '2') & (rf_fs$votes[ , 2] > 0.6), , drop = FALSE]
+cat2_fs <- rf_fs$predicted[(rf_fs$predicted =='2') & (rf_fs$votes[ , 2] > 0.6)]
+
+cate <- as.factor(c(as.character(cat1_fs), as.character(cat2_fs)))
+feature <- as.matrix(rbind(fea1_fs, fea2_fs))
+
+set <- sample(1: nrow(feature), nrow(feature), replace = F)
+cate <- cate[set]
+feature <- feature[set, ] 
+
+rf_whole <- randomForest(feature, as.factor(cate), importance = TRUE, proximity = TRUE)
+pred_whole <- predict(rf_whole, newdata = feature_fs)
+
+df0 <- AddMetaData(df0, metadata = pred_whole, col.name = "pred")
+ord <- order(df0@meta.data$pred)
+temp <- df0@scale.data[c(#E12.5_markers[2:53,1],
+                         "ENSMUSG00000055435|MAF",
+                         "ENSMUSG00000004366|SST",
+                         "ENSMUSG00000074622|MAFB",
+                         "ENSMUSG00000028222|CALB1",
+                         "ENSMUSG00000000214|TH"), ]
+
+# res <- df0.E12.5.neu@data[,df0.E12.5.neu@data["ENSMUSG00000004366|SST",] > 0]
+# temp <- res[c("ENSMUSG00000004366|SST","ENSMUSG00000055435|MAF",
+#               "ENSMUSG00000074622|MAFB",
+#               colnames(feature)),]
+ColSideColors <- c(gg_color_hue(3)[as.numeric(as.factor(df0@meta.data$region))],
+                   rainbow(2)[as.numeric(as.factor(df0@meta.data$time_point))],
+                   brewer.pal(3, name = "Paired")[df0@meta.data$pred])#,
+ColSideColors <- matrix(ColSideColors, nrow = ncol(temp))
+ColSideColors <- ColSideColors[ord,]
+
+col <- colorRampPalette(colors = c("#1b75bb", "black","#faaf40"))(1000)
+
+pairs.breaks <- seq(-1.5, 1.5, length.out=1001);
+
+pdf(file = paste(Sys.Date(), "temp_all_cells_neuron_progenitor_heatmap_predicted.pdf", sep = "_"),
+    width = 10, height = 5, useDingbats = F);
+heatmap.3(temp,
+          breaks = pairs.breaks,
+          #symbreaks = T,
+          keysize = 0.8,
+          key = F,
+          main=NA,
+          col = col,
+          symkey = F,
+          cexRow=0.5, 
+          cexCol = 0.6, 
+          Rowv = T, 
+          Colv = F,#as.dendrogram(clu), 
+          ColSideColors = ColSideColors,
+          ColSideColorsSize = 3,
+          # dendrogram = "both",
+          scale = "row",
+          #colsep = colsep,
+          sepcolor = "black",
+          labRow = substr(rownames(temp), 20, 100),
+          labCol = "",
+          na.rm = F);
+dev.off(dev.cur());
